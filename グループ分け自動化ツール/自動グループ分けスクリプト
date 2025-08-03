@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+社員グループ自動分け GUI
+--------------------------------------------------------------
+◎ 2025-08-04  Custom v4  ⭐ 完全ペア視点の制約実装 ⭐
+    • 『同じ所属メンバー数』『過去に同席した人数』を
+      “自分を除いた人数 0〜3 人まで” で指定できるように変更
+        0人 – 誰もいない / 1人まで / 2人まで / 3人まで
+    • 0を選ぶと → 同部署も過去ペアも 1 人もいない完全シャッフルを保証
+依存:  pip install ortools
+"""
+
+from __future__ import annotations
+
+import csv
+import itertools
+import random
+import sys
+from pathlib import Path
+from typing import Dict, List, Set
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+# ---------- OR-Tools ----------
+try:
+    from ortools.sat.python import cp_model  # type: ignore
+except ModuleNotFoundError:
+    tk.Tk().withdraw()
+    messagebox.showerror(
+        "OR-Tools が見つかりません",
+        "pip install ortools を実行してから起動してください。",
+    )
+    sys.exit(1)
+
+# ---------- CSV ----------
+def read_members(path: Path):
+    with path.open(newline="", encoding="utf-8") as f:
+        rdr = csv.DictReader(f)
+        if not {"社員名", "所属組織名"}.issubset(rdr.fieldnames or {}):
+            raise ValueError("社員リストは [社員名, 所属組織名] の列を含めてください。")
+        return [
+            {"name": r["社員名"].strip(), "dept": r["所属組織名"].strip()}
+            for r in rdr
+            if r.get("社員名")
+        ]
+
+
+def read_past_groups(paths: List[Path]):
+    need = {"社員名", "グループ名"}
+    res: List[Set[str]] = []
+    for p in paths:
+        with p.open(newline="", encoding="utf-8") as f:
+            rdr = csv.DictReader(f)
+            if not need.issubset(rdr.fieldnames or {}):
+                raise ValueError(f"{p.name}: 列 [社員名, グループ名] が見つかりません。")
+            mp: Dict[str, Set[str]] = {}
+            for r in rdr:
+                n, g = r.get("社員名", "").strip(), r.get("グループ名", "").strip()
+                if n and g:
+                    mp.setdefault(g, set()).add(n)
+            res.extend(mp.values())
+    return res
+
+# ---------- グループサイズ ----------
+def choose_sizes(total: int, allowed: List[int]) -> List[int]:
+    allowed = sorted(allowed, reverse=True)
+
+    def dfs(rem, start, stack):
+        if rem == 0:
+            return stack
+        for i in range(start, len(allowed)):
+            sz = allowed[i]
+            if sz > rem:
+                continue
+            ans = dfs(rem - sz, i, stack + [sz])
+            if ans:
+                return ans
+        return None
+
+    res = dfs(total, 0, [])
+    if not res:
+        raise RuntimeError(f"許可サイズ {allowed} では {total} 人を割り切れません。")
+    random.shuffle(res)
+    return res
+
+# ---------- CP-SAT ----------
+def assign_groups_cp_sat(
+    members,
+    past_groups,
+    allowed_sizes,
+    ui_same_dept_limit: int,   # 0-3 (自分から見た人数)
+    ui_past_pair_limit: int,   # 0-3
+    timelimit_sec=30,
+):
+    names = [m["name"] for m in members]
+    depts = [m["dept"] for m in members]
+    n = len(names)
+    group_sizes = choose_sizes(n, allowed_sizes)
+    G = len(group_sizes)
+
+    # 部署 → index リスト
+    idx_by_dept: Dict[str, List[int]] = {}
+    for i, d in enumerate(depts):
+        idx_by_dept.setdefault(d, []).append(i)
+
+    # 過去ペア集合  i -> {j1, j2, ...}
+    past_mates: Dict[int, Set[int]] = {i: set() for i in range(n)}
+    for pg in past_groups:
+        idxs = [i for i, nm in enumerate(names) if nm in pg]
+        for a, b in itertools.combinations(idxs, 2):
+            past_mates[a].add(b)
+            past_mates[b].add(a)
+
+    # ---------- CP モデル ----------
+    model = cp_model.CpModel()
+    x = {(i, g): model.NewBoolVar(f"x_{i}_{g}") for i in range(n) for g in range(G)}
+
+    # 1. 各社員は 1 グループ
+    for i in range(n):
+        model.Add(sum(x[i, g] for g in range(G)) == 1)
+
+    # 2. グループ定員
+    for g, cap in enumerate(group_sizes):
+        model.Add(sum(x[i, g] for i in range(n)) == cap)
+
+    # 3. ── ★『自分視点』 制約 ──────────────────
+    for i in range(n):
+        for g in range(G):
+            # 3-A. 同じ部署人数 (自分を除く)
+            same_dept_count = model.NewIntVar(0, group_sizes[g] - 1, f"deptCnt_{i}_{g}")
+            model.Add(
+                same_dept_count
+                == sum(x[j, g] for j in idx_by_dept[depts[i]] if j != i)
+            )
+            model.Add(same_dept_count <= ui_same_dept_limit).OnlyEnforceIf(x[i, g])
+
+            # 3-B. 過去ペア人数 (自分を除く)
+            mates = past_mates[i]
+            past_pair_count = model.NewIntVar(0, group_sizes[g] - 1, f"pairCnt_{i}_{g}")
+            if mates:
+                model.Add(past_pair_count == sum(x[j, g] for j in mates))
+            else:
+                model.Add(past_pair_count == 0)
+            model.Add(past_pair_count <= ui_past_pair_limit).OnlyEnforceIf(x[i, g])
+
+    # 4. 目的関数: 過去ペア重複最小
+    past_pairs_all = {
+        frozenset((a, b))
+        for pg in past_groups
+        for a, b in itertools.combinations(pg, 2)
+    }
+    overlap_bools = []
+    for g in range(G):
+        for a, b in itertools.combinations(range(n), 2):
+            if frozenset((names[a], names[b])) not in past_pairs_all:
+                continue
+            bvar = model.NewBoolVar(f"pair_{a}_{b}_{g}")
+            model.AddBoolAnd([x[a, g], x[b, g]]).OnlyEnforceIf(bvar)
+            overlap_bools.append(bvar)
+    model.Minimize(sum(overlap_bools))
+
+    # ---------- ソルバー ----------
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = timelimit_sec
+    solver.parameters.num_search_workers = 8
+    if solver.Solve(model) not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        raise RuntimeError("条件を満たす解が見つかりませんでした。")
+
+    groups: List[List[str]] = [[] for _ in range(G)]
+    for i, nm in enumerate(names):
+        for g in range(G):
+            if solver.BooleanValue(x[i, g]):
+                groups[g].append(nm)
+                break
+    return groups
+
+# ---------- GUI ----------
+class GroupGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("社員グループ自動分け (CP-SAT ペア視点 v4)")
+        self.geometry("860x680")
+        self.resizable(False, False)
+
+        # ① 入力ファイル
+        frm = ttk.LabelFrame(self, text="① 入力ファイル")
+        frm.place(x=10, y=10, width=840, height=150)
+
+        ttk.Label(frm, text="社員リスト CSV").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.members_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.members_var, width=83).grid(row=0, column=1)
+        ttk.Button(frm, text="選択…", command=self.choose_members).grid(row=0, column=2)
+
+        ttk.Label(frm, text="過去グループ表 CSV (複数可)").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.past_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=self.past_var, width=83).grid(row=1, column=1)
+        ttk.Button(frm, text="追加…", command=self.add_past).grid(row=1, column=2)
+
+        # ② 制約オプション
+        opt = ttk.LabelFrame(self, text="② 制約オプション")
+        opt.place(x=10, y=170, width=840, height=160)
+
+        # グループ定員
+        ttk.Label(opt, text="グループ定員（複数選択可）").grid(row=0, column=0, padx=5, sticky="w")
+        self.size_vars: Dict[int, tk.BooleanVar] = {}
+        for i, sz in enumerate(range(3, 11)):
+            v = tk.BooleanVar(value=sz in (5, 6))
+            self.size_vars[sz] = v
+            ttk.Checkbutton(opt, text=str(sz), variable=v).grid(row=0, column=i + 1, sticky="w")
+
+        # 同所属 (ペア視点)
+        ttk.Label(opt, text="同じ所属メンバー数（自分を除く）").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.dept_limit_ui = tk.IntVar(value=0)
+        dept_labels = [
+            ("0人 – 誰もいない", 0),
+            ("1人まで", 1),
+            ("2人まで", 2),
+            ("3人まで", 3),
+        ]
+        for i, (txt, val) in enumerate(dept_labels):
+            ttk.Radiobutton(opt, text=txt, variable=self.dept_limit_ui, value=val).grid(
+                row=1, column=i + 1, sticky="w"
+            )
+
+        # 過去ペア
+        ttk.Label(opt, text="過去に同じグループだった人数（自分を除く）").grid(
+            row=2, column=0, padx=5, pady=5, sticky="w"
+        )
+        self.past_limit_ui = tk.IntVar(value=1)
+        past_labels = [
+            ("0人 – 全員初対面", 0),
+            ("1人まで", 1),
+            ("2人まで", 2),
+            ("3人まで", 3),
+        ]
+        for i, (txt, val) in enumerate(past_labels):
+            ttk.Radiobutton(opt, text=txt, variable=self.past_limit_ui, value=val).grid(
+                row=2, column=i + 1, sticky="w"
+            )
+
+        # ③ ボタン
+        ttk.Button(self, text="③ グループ分け実行", width=25, command=self.run).place(x=20, y=340)
+        ttk.Button(self, text="結果を CSV 保存", width=18, command=self.save_csv).place(x=280, y=340)
+
+        # ④ 結果
+        resf = ttk.LabelFrame(self, text="④ 結果")
+        resf.place(x=10, y=380, width=840, height=280)
+        self.result_box = scrolledtext.ScrolledText(resf, font=("Consolas", 10))
+        self.result_box.pack(fill="both", expand=True)
+
+        self.members_path: Path | None = None
+        self.past_paths: List[Path] = []
+
+    # ---------- ファイル操作 ----------
+    def choose_members(self):
+        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv")])
+        if p:
+            self.members_path = Path(p)
+            self.members_var.set(p)
+
+    def add_past(self):
+        ps = filedialog.askopenfilenames(filetypes=[("CSV", "*.csv")])
+        if ps:
+            self.past_paths.extend(Path(x) for x in ps)
+            self.past_paths = list({p.resolve() for p in self.past_paths})
+            self.past_var.set("; ".join(p.name for p in self.past_paths))
+
+    # ---------- 実行 ----------
+    def run(self):
+        self.result_box.delete("1.0", tk.END)
+        if not self.members_path:
+            messagebox.showerror("エラー", "社員リスト CSV を選択してください")
+            return
+
+        allowed = [sz for sz, v in self.size_vars.items() if v.get()]
+        if not allowed:
+            messagebox.showerror("エラー", "少なくとも 1 つグループ定員を選択してください")
+            return
+
+        try:
+            members = read_members(self.members_path)
+            past_groups = read_past_groups(self.past_paths) if self.past_paths else []
+            groups = assign_groups_cp_sat(
+                members,
+                past_groups,
+                allowed_sizes=allowed,
+                ui_same_dept_limit=self.dept_limit_ui.get(),
+                ui_past_pair_limit=self.past_limit_ui.get(),
+            )
+        except Exception as e:
+            messagebox.showerror("解が見つかりません", str(e))
+            return
+
+        name_to_dept = {m["name"]: m["dept"] for m in members}
+        lines = ["社員名,所属組織名,グループ名"]
+        for idx, g in enumerate(groups, 1):
+            gname = f"Group{idx}"
+            for n in g:
+                lines.append(f"{n},{name_to_dept[n]},{gname}")
+
+        self.result_box.insert(tk.END, "\n".join(lines))
+        messagebox.showinfo("完了", f"{len(groups)} グループに分けました！")
+
+    # ---------- 保存 ----------
+    def save_csv(self):
+        txt = self.result_box.get("1.0", tk.END).strip()
+        if not txt:
+            messagebox.showwarning("警告", "結果がありません。まず実行してください")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="groups.csv"
+        )
+        if p:
+            Path(p).write_text(txt, encoding="utf-8", newline="\n")
+            messagebox.showinfo("保存", f"{Path(p).name} を保存しました")
+
+
+# ---------- 起動 ----------
+if __name__ == "__main__":
+    GroupGUI().mainloop()
